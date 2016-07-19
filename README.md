@@ -1,7 +1,7 @@
 # mocp-i3blocks-status
 Shows mocp song name and state in your i3 bar (made for i3blocks)
 
-![Screenshot][screenshots/example.png]
+![Screenshot](https://github.com/curtmack/mocp-i3blocks-status/raw/master/screenshots/example.png)
 
 ## Prerequisites
 Requires the following CPAN packages:
@@ -29,15 +29,15 @@ interval=1
 ### Seekbar styles
 
 Unicode:
-![Unicode][screenshots/unicode_seekbar.png]
+![Unicode](https://github.com/curtmack/mocp-i3blocks-status/raw/master/screenshots/unicode_seekbar.png)
 
 ASCII:
-![ASCII][screenshots/ascii_seekbar.png]
+![ASCII](https://github.com/curtmack/mocp-i3blocks-status/raw/master/screenshots/ascii_seekbar.png)
 
 ### Default settings
 
 Long:
-![Long][screenshots/default_long_format.png]
+![Long](https://github.com/curtmack/mocp-i3blocks-status/raw/master/screenshots/default_long_format.png)
 
 Short:
-![Short][screenshots/default_short_format.png]
+![Short](https://github.com/curtmack/mocp-i3blocks-status/raw/master/screenshots/default_short_format.png)

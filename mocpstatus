@@ -1,0 +1,444 @@
+#!/usr/bin/env perl
+
+use strict;
+use warnings;
+use utf8;
+
+use POSIX qw/ceil floor/;
+use List::Util qw/max/;
+
+use File::HomeDir;
+use IPC::Run3 qw/run3/;
+use YAML::Tiny;
+
+#############################
+# HANDLE YAML CONFIGURATION #
+#############################
+
+# This will get saved to the home directory if there's no user YAML
+# Then it will get loaded
+my $defaultYamlFile = <<'...';
+---
+# Document 1 contains the actual configuration
+
+# Note that since mocpstatus uses YAML::Tiny, parts of the YAML specification
+# are not supported. Most of the parts that are used regularly should work
+# though.
+
+# Step size for seek commands, in seconds
+seekstep: 5
+
+# Step size for volume commands, in percentage points
+volumestep: 10
+
+# Threshold for the prev0 action going to the previous song instead of seeking
+# to the beginning of the current song, in seconds
+prev0threshold: 5
+
+# Information for how to render each state
+# Valid states are PLAY, STOP, and PAUSE, as well as "off" for when the server
+# is not running
+# For your configuring pleasure, we've lower-cased them here
+# Each state has two values to configure:
+# - symbol: The symbol to display for that state
+# - color:  The color to use when in that state
+# - msg:    Only for stop and off. What should be shown in the place of the
+#           format string, since these states do not have a current song.
+states:
+  play:
+    # Consider |> if your font has a ligature for it, e.g. Fira Code
+    # The screenshots on Github were taken using PragmataPro
+    symbol: " >"
+    color: "#A0A0FF"
+  pause:
+    symbol: "||"
+    color: "#D0D000"
+  stop:
+    symbol: "[]"
+    color: "#FF0000"
+    msg: "(No song playing)"
+  off:
+    symbol: "[]"
+    color: "#FF0000"
+    msg: "(Server not running)"
+
+# Format strings are passed to the mocp --format option
+# The following will be substituted:
+# - %state          State (PLAY, PAUSE, or STOP)
+# - %file           Canonical path to file
+# - %title          Song title, as it would be displayed by mocp
+#                   (configured by mocp's FormatString option)
+# - %artist or %a   Artist name
+# - %song   or %t   Song title
+# - %album  or %A   Album name
+# - %n              Track number
+# - %tt             Total time in MM:SS
+# - %tl             Time left in MM:SS
+# - %ts             Total time in seconds
+# - %ct             Current time in MM:SS
+# - %cs             Current time in seconds
+# - %b              Bitrate
+# - %r              Sample rate
+
+# Note that while there is technically nothing stopping you from including
+# newlines in either your format strings or in the filenames/ID3 tags of your
+# music library, doing so will break this script, so I recommend you not do
+# that.
+
+# Additionally, note that there is *no* way to escape these, or to include a
+# literal % character (although % characters will work if they're part of an
+# included tag).
+
+# Long name settings
+# This is what i3bar will prefer to display if it has room
+longname:
+  # List of format strings for long name
+  formats:
+    - "%title"
+  # Time per format string
+  # If more than one format string is provided, the marquee will linger on each
+  # one for this many seconds, then move on to the next
+  cycletime: 3
+  # Seek bar settings
+  seekbar:
+    # Show the seek bar
+    # 1 to show, 0 to hide
+    show: 1
+    # Length of the seek bar, in characters
+    # Note that both seek bar styles have a prefix and suffix character, so the
+    # actual length will be two greater than this value
+    length: 10
+    # Seek bar style
+    # "unicode" uses unicode characters from the Block Elements block
+    # "ascii" uses only printable ASCII (specifically [, ], =, and -)
+    style: unicode
+
+# Short name settings
+# This is what i3bar will fall back on if it doesn't have room for the long name
+# Same settings as above
+shortname:
+  formats:
+    - "%artist - %song"
+    - "%album"
+  cycletime: 3
+  seekbar:
+    show: 1
+    length: 10
+    style: unicode
+
+# Mouse bindings
+# "btnX: ACTION" means that mouse button X on the block should cause ACTION
+# Valid actions:
+# - play:        Play. Does nothing if already playing.
+# - stop:        Stop. Does nothing if already stopped.
+# - pause:       Pause. Does nothing if already paused, or if stopped.
+# - playpause:   Toggle between play and pause. Has no effect if stopped.
+# - playstop:    Toggle between play and stop. Stops if paused.
+# - seek0:       Seek to beginning of current song.
+# - prev0:       Go to previous song if in the first {prev0threshold} seconds,
+#                seek to beginning of current song otherwise
+# - prev:        Go to previous song.
+# - next:        Go to next song.
+# - rwd:         Seek backwards {seekstep} seconds.
+# - fwd:         Seek forwards {seekstep} seconds.
+# - vol+:        Increase volume {volumestep} percentage points.
+# - vol-:        Decrease volume {volumestep} percentage points.
+# - startserver: Starts the mocp server
+# - stopserver:  Exits the mocp server
+mousebinds:
+  btn1: playpause
+  btn3: playstop
+  btn4: vol+
+  btn5: vol-
+  btn6: prev0
+  btn7: next
+--- >
+Subsequent documents are entirely reserved for the user; mocpstatus will ignore
+their contents. You may put any metadata you would like here for your own
+purposes.
+...
+
+# Name of user YAML file
+my $userYamlFile = $ARGV[0] || File::HomeDir->my_home . "/.mocpstatusrc.yml";
+
+# Before we can load...
+if ( ! (-e $userYamlFile) ) {
+	# Don't try and touch a user-provided filename, just die if that file doesn't exist
+	$ARGV[0] and die "Could not locate file named $ARGV[0]";
+
+	# Otherwise dump the default YAML file into the default location.
+	open (my $yamlOut, ">", $userYamlFile)
+	  or die "Can't open > $userYamlFile: $!";
+
+	print $yamlOut $defaultYamlFile;
+
+	close($yamlOut);
+}
+
+# Okay, _now_ load user YAML file
+my $config = YAML::Tiny->read($userYamlFile)->[0];
+
+################################
+# CHECK FOR SERVER NOT RUNNING #
+################################
+
+# Subroutine for calling mocp
+# Will return the exit code and store the STDOUT into the first argument,
+# which should be a reference (or undef to not redirect STDOUT)
+sub mocp {
+	my $stdoutRef = shift;
+	my @args = @_;
+
+	run3(['mocp', @args], undef, $stdoutRef, undef);
+
+	# Return the exit code
+	$?;
+}
+
+# Get info from mocp
+# mocp --info is a good command for checking if the server is running, it will
+# always succeed without side-effect if the server is running, and always fail
+# if it isn't.
+
+# Save this for later
+my $serverRunning = ( mocp(\undef, '--info') == 0 );
+
+############
+# GET INFO #
+############
+
+sub getInfo {
+	# Need to get the state, current time in seconds, and total time in seconds
+	my @formatStrings = ('%state', '%cs', '%ts');
+
+	# Get format strings for long and short name
+	my @shortFormatStrings = @{ $config->{shortname}->{formats} };
+	my @longFormatStrings  = @{ $config->{longname} ->{formats} };
+	push @formatStrings, @shortFormatStrings;
+	push @formatStrings, @longFormatStrings;
+
+	my $bigFormatStr = join "\n", @formatStrings;
+	my $bigOutStr = "";
+	mocp (\$bigOutStr, '--format', $bigFormatStr);
+	chomp $bigOutStr;
+
+	my @outStrings = split /\n/, $bigOutStr;
+
+	# Extract the state, current time and total time from the output
+	my $st = shift @outStrings;
+	my $cs = shift @outStrings;
+	my $ts = shift @outStrings;
+
+	# Extract the short and long names from the output
+	my @shortNames = ();
+	my @longNames = ();
+
+	for (my $i = 0; $i < scalar @shortFormatStrings; $i++) {
+		push @shortNames, shift(@outStrings);
+	}
+	for (my $i = 0; $i < scalar @longFormatStrings;  $i++) {
+		push @longNames,  shift(@outStrings);
+	}
+
+	($st, $cs, $ts, \@shortNames, \@longNames);
+}
+
+my ($state, $currTime, $totTime, $shortNames, $longNames);
+if ($serverRunning) {
+	($state, $currTime, $totTime, $shortNames, $longNames) = &getInfo();
+}
+
+#######################
+# HANDLE BUTTON INPUT #
+#######################
+
+sub btnAction {
+	my ($state, $currTime, $act) = @_;
+
+	my %btnCodeMap = ( play        => sub { mocp(\undef, '--play') },
+	                   stop        => sub { mocp(\undef, '--stop') },
+	                   pause       => sub { mocp(\undef, '--pause') },
+	                   playpause   => sub { mocp(\undef, '--toggle-pause') },
+	                   playstop    => sub {
+	                                   if ($state eq 'STOP') {
+		                                   mocp(\undef, '--play');
+	                                   } else {
+		                                   mocp(\undef, '--stop');
+	                                   }
+	                                  },
+	                   seek0       => sub { mocp(\undef, '--jump', '0s') },
+	                   prev0       => sub {
+	                                   if ($currTime < $config->{prev0threshold}) {
+		                                   mocp(\undef, '--previous');
+	                                   } else {
+		                                   mocp(\undef, '--jump', '0s');
+	                                   }
+	                                  },
+	                   prev        => sub { mocp(\undef, '--previous') },
+	                   next        => sub { mocp(\undef, '--next') },
+	                   rwd         => sub { mocp(\undef, '--seek',   '-' . $config->{seekstep}) },
+	                   fwd         => sub { mocp(\undef, '--seek',   '+' . $config->{seekstep}) },
+	                   "vol-"      => sub { mocp(\undef, '--volume', '-' . $config->{volumestep}) },
+	                   "vol+"      => sub { mocp(\undef, '--volume', '+' . $config->{volumestep}) },
+	                   startserver => sub { mocp(\undef, '--server') },
+	                   stopserver  => sub { mocp(\undef, '--exit') }
+	                 );
+
+	if (defined ($btnCodeMap{$act})) {
+		my $action = $btnCodeMap{$act};
+		&$action();
+	}
+}
+
+my $btn = $ENV{BLOCK_BUTTON};
+
+if ( defined($btn) && defined( $config->{mousebinds}->{"btn$btn"} ) ) {
+	my $action = $config->{mousebinds}->{"btn$btn"};
+	&btnAction($state, $currTime, $action);
+
+	# State might have changed
+	# Update server running status
+	$serverRunning = ( mocp(\undef, '--info') == 0 );
+
+	# Update other info
+	if ($serverRunning) {
+		($state, $currTime, $totTime, $shortNames, $longNames) = &getInfo();
+	}
+}
+
+#################
+# HANDLE OUTPUT #
+#################
+
+unless ($serverRunning) {
+	# *Now* we can safely report that the server is not running
+	my $offSym   = $config->{states}->{off}->{symbol};
+	my $offColor = $config->{states}->{off}->{color};
+	my $offMsg   = $config->{states}->{off}->{msg};
+	print "$offSym $offMsg\n";
+	print "$offSym $offMsg\n";
+	print "$offColor\n";
+	exit 0;
+}
+
+sub centerPad {
+	my ($s, $len) = @_;
+
+	my $padLen = $len - length($s);
+
+	my $left  = ceil ($padLen / 2);
+	my $right = floor($padLen / 2);
+
+	(" " x $left) . $s . (" " x $right);
+}
+
+sub getMarqueeString {
+	my $secondsPer  = shift;
+	my @names       = @_;
+
+	my $seconds     = time();
+	my $cycle       = scalar(@names) * $secondsPer;
+	my $which       = floor(($seconds % $cycle) / $secondsPer);
+
+	my $maxWidth    = max( map length, @names );
+
+	my @paddedNames = map { centerPad($_, $maxWidth) } @names;
+	my $selected    = $paddedNames[$which];
+
+	"$selected";
+}
+
+sub drawSeekBar {
+	my $state     = shift;
+	my $currTime  = shift;
+	my $totTime   = shift;
+	my $barLen    = shift;
+
+	my $prefix    = shift;
+	my $suffix    = shift;
+
+	my $fullBar   = shift;
+	my @barFragments = @_;
+
+	my $baseTicks = scalar @barFragments;
+
+	if ($state eq "STOP") {
+		"";
+	} else {
+		# add one tick so that the bar will be briefly empty at the start, and
+		# briefly full before going to the next song
+		my $barTicks  = $barLen * $baseTicks + 1;
+		my $barPos    = ($currTime * 1.0) / $totTime;
+		my $songTicks = floor($barPos * $barTicks);
+
+		# on the offchance the God of Floating Point Arithmetic gets us an exact
+		# 1.0 on the bar position, make sure the bar isn't bigger than it should
+		# be
+		if ($songTicks > ($barLen * $baseTicks)) {
+			$songTicks = $barLen * $baseTicks;
+		}
+
+		my $barStr = $prefix;
+		for (my $i = 0; $i < $barLen; $i++) {
+			if ($songTicks >= $baseTicks) {
+				$barStr .= $fullBar;
+			} else {
+				# just take out of barFragments
+				$barStr .= $barFragments[$songTicks];
+			}
+
+			$songTicks -= $baseTicks;
+			if ($songTicks < 0) {
+				$songTicks = 0;
+			}
+		}
+		$barStr .= $suffix;
+
+		$barStr;
+	}
+}
+
+sub getName {
+	my $state    = shift;
+	my $nameType = shift;
+	my $nameList = shift;
+	my $currTime = shift;
+	my $totTime  = shift;
+
+	my $stateSym = $config->{states}->{lc($state)}->{symbol};
+
+	if ($state eq "STOP") {
+		my $msg = $config->{states}->{stop}->{msg};
+		return "$stateSym $msg";
+	}
+
+	my $title    = &getMarqueeString($config->{$nameType}->{cycletime},
+	                                 @$nameList);
+
+	if ($config->{$nameType}->{seekbar}->{show}) {
+		my $seekbar = "";
+		my $barLen  = $config->{$nameType}->{seekbar}->{length};
+		if ($config->{$nameType}->{seekbar}->{style} eq "unicode") {
+			$seekbar = &drawSeekBar($state, $currTime, $totTime, $barLen,
+			                        "\x{2592}", "\x{2592}",
+			                        "\x{2588}",
+			                        " ",        "\x{258F}", "\x{258E}", "\x{258D}",
+			                        "\x{258C}", "\x{258B}", "\x{258A}", "\x{2589}");
+		} elsif ($config->{$nameType}->{seekbar}->{style} eq "ascii") {
+			$seekbar = &drawSeekBar($state, $currTime, $totTime, $barLen,
+			                        "[", "]",
+			                        "=",
+			                        " ", "-");
+		}
+
+		"$stateSym $title $seekbar";
+	} else {
+		"$stateSym $title";
+	}
+}
+
+binmode STDOUT, ":encoding(utf8)";
+
+print &getName($state, "longname",  $longNames,  $currTime, $totTime) . "\n";
+print &getName($state, "shortname", $shortNames, $currTime, $totTime) . "\n";
+print $config->{states}->{lc($state)}->{color}                        . "\n";

@@ -47,7 +47,6 @@ prev0threshold: 5
 states:
   play:
     # Consider |> if your font has a ligature for it, e.g. Fira Code
-    # The screenshots on Github were taken using PragmataPro
     symbol: " >"
     color: "#A0A0FF"
   pause:

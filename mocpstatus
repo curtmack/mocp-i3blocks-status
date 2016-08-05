@@ -188,7 +188,7 @@ sub mocp {
 	my $stdoutRef = shift;
 	my @args = @_;
 
-	run3(['mocp', @args], undef, $stdoutRef, undef);
+	run3(['mocp', @args], undef, $stdoutRef, undef, { binmode_stdout => ':utf8' });
 
 	# Return the exit code
 	$?;
